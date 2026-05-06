@@ -1,0 +1,51 @@
+version: '3.9'
+
+services:
+  # ── Production-like app ──────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: taskflow:latest
+    container_name: taskflow-app
+    ports:
+      - "5000:5000"
+    volumes:
+      - taskflow-data:/data
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-change-me}
+      - DATABASE_URL=sqlite:////data/taskflow.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── Dev server with hot-reload ──────────────────────────
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    image: taskflow:dev
+    container_name: taskflow-dev
+    command: >
+      sh -c "pip install flask flask-sqlalchemy flask-migrate &&
+             FLASK_DEBUG=1 python run.py"
+    ports:
+      - "5001:5000"
+    volumes:
+      - .:/app
+      - taskflow-dev-data:/data
+    environment:
+      - FLASK_DEBUG=1
+      - DATABASE_URL=sqlite:////data/taskflow_dev.db
+    profiles: ["dev"]
+
+volumes:
+  taskflow-data:
+  taskflow-dev-data:

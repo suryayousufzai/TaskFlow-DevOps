@@ -1,0 +1,231 @@
+name: TaskFlow CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  IMAGE_NAME: taskflow
+  REGISTRY: ghcr.io
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # JOB 1: Lint & Static Analysis
+  # ─────────────────────────────────────────────────────────
+  lint:
+    name: 🔍 Lint & Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install lint tools
+        run: pip install flake8 bandit
+
+      - name: Run flake8 (style check)
+        run: |
+          flake8 app/ run.py \
+            --max-line-length=120 \
+            --exclude=__pycache__,migrations \
+            --statistics
+
+      - name: Run bandit (security scan)
+        run: |
+          bandit -r app/ -ll \
+            --exclude app/static \
+            -f txt || true  # warn only, don't block
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 2: Unit Tests
+  # ─────────────────────────────────────────────────────────
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest with coverage
+        run: |
+          pip install pytest-cov
+          pytest tests/ -v \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --tb=short
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 3: Docker Build & Test
+  # ─────────────────────────────────────────────────────────
+  docker-build:
+    name: 🐳 Docker Build & Smoke Test
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:test
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run container smoke test
+        run: |
+          docker run -d \
+            --name taskflow-test \
+            -p 5000:5000 \
+            -e SECRET_KEY=ci-test-key \
+            ${{ env.IMAGE_NAME }}:test
+
+          echo "Waiting for container to be healthy..."
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:5000/health > /dev/null 2>&1; then
+              echo "✅ App is healthy!"
+              break
+            fi
+            echo "Attempt $i/15 — waiting..."
+            sleep 2
+          done
+
+          echo "── Health check ──"
+          curl -sf http://localhost:5000/health | python3 -m json.tool
+
+          echo "── API: List tasks ──"
+          curl -sf http://localhost:5000/api/tasks | python3 -m json.tool
+
+          echo "── API: Create task ──"
+          curl -sf -X POST http://localhost:5000/api/tasks \
+            -H "Content-Type: application/json" \
+            -d '{"title":"CI smoke test","priority":"high"}' \
+            | python3 -m json.tool
+
+          echo "── API: Stats ──"
+          curl -sf http://localhost:5000/api/stats | python3 -m json.tool
+
+          docker stop taskflow-test
+          docker rm taskflow-test
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:test
+          format: table
+          exit-code: '0'
+          severity: HIGH,CRITICAL
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 4: Push to Registry (main branch only)
+  # ─────────────────────────────────────────────────────────
+  push-image:
+    name: 📦 Push to Registry
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 5: Deploy (simulated)
+  # ─────────────────────────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: push-image
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: http://localhost:5000
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via Docker Compose
+        run: |
+          echo "Deploying TaskFlow to production environment..."
+          echo "Image: ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}:latest"
+          echo ""
+          echo "In a real environment this step would:"
+          echo "  1. SSH into production server"
+          echo "  2. Pull latest image from registry"
+          echo "  3. Run: docker compose up -d --pull always"
+          echo "  4. Verify health endpoint"
+          echo "  5. Send deployment notification to Slack/Teams"
+          echo ""
+          echo "✅ Deployment simulated successfully!"
+
+      - name: Create deployment summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ✅ Deployed |" >> $GITHUB_STEP_SUMMARY

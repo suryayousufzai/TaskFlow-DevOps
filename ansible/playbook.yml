@@ -1,0 +1,185 @@
+---
+# ═══════════════════════════════════════════════════════════════════
+#  TaskFlow — Ansible Playbook
+#  Provisions and deploys the TaskFlow app on a target host
+#  Usage: ansible-playbook -i inventory.yml playbook.yml
+# ═══════════════════════════════════════════════════════════════════
+
+- name: Provision TaskFlow Application Server
+  hosts: taskflow_servers
+  become: true
+  vars:
+    app_name: taskflow
+    app_user: taskflow
+    app_dir: /opt/taskflow
+    app_port: 5000
+    docker_image: "taskflow:latest"
+    environment: production
+
+  tasks:
+
+    # ── System Prerequisites ──────────────────────────────────
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - git
+          - python3
+          - python3-pip
+        state: present
+
+    # ── Docker Installation ───────────────────────────────────
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker Engine
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: Ensure Docker is started and enabled
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    # ── App User & Directories ────────────────────────────────
+    - name: Create application user
+      user:
+        name: "{{ app_user }}"
+        system: yes
+        shell: /sbin/nologin
+        home: "{{ app_dir }}"
+        create_home: yes
+
+    - name: Add app user to docker group
+      user:
+        name: "{{ app_user }}"
+        groups: docker
+        append: yes
+
+    - name: Create application directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+      loop:
+        - "{{ app_dir }}"
+        - "{{ app_dir }}/data"
+        - "{{ app_dir }}/logs"
+
+    # ── Application Deployment ────────────────────────────────
+    - name: Copy Docker Compose file
+      copy:
+        src: ../docker-compose.yml
+        dest: "{{ app_dir }}/docker-compose.yml"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+
+    - name: Generate secret key
+      command: python3 -c "import secrets; print(secrets.token_hex(32))"
+      register: secret_key_result
+      changed_when: false
+
+    - name: Write environment file
+      template:
+        src: templates/env.j2
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600'
+      vars:
+        secret_key: "{{ secret_key_result.stdout }}"
+
+    - name: Pull Docker image
+      docker_image:
+        name: "{{ docker_image }}"
+        source: pull
+        state: present
+
+    - name: Start application with Docker Compose
+      community.docker.docker_compose_v2:
+        project_src: "{{ app_dir }}"
+        state: present
+        pull: always
+
+    # ── Health Check ──────────────────────────────────────────
+    - name: Wait for application to be healthy
+      uri:
+        url: "http://localhost:{{ app_port }}/health"
+        method: GET
+        status_code: 200
+      register: health_result
+      retries: 10
+      delay: 5
+      until: health_result.status == 200
+
+    - name: Print deployment status
+      debug:
+        msg: |
+          ✅ TaskFlow deployed successfully!
+          URL: http://{{ ansible_default_ipv4.address }}:{{ app_port }}
+          Status: {{ health_result.json.status }}
+
+    # ── Systemd Service (optional) ────────────────────────────
+    - name: Create systemd service for auto-start
+      template:
+        src: templates/taskflow.service.j2
+        dest: /etc/systemd/system/taskflow.service
+        mode: '0644'
+
+    - name: Enable and start TaskFlow service
+      systemd:
+        name: taskflow
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    # ── Firewall ──────────────────────────────────────────────
+    - name: Allow app port through UFW
+      ufw:
+        rule: allow
+        port: "{{ app_port }}"
+        proto: tcp
+
+- name: Configure monitoring (optional)
+  hosts: taskflow_servers
+  become: true
+  tasks:
+    - name: Set up log rotation
+      copy:
+        content: |
+          /opt/taskflow/logs/*.log {
+            daily
+            rotate 14
+            compress
+            delaycompress
+            missingok
+            notifempty
+            sharedscripts
+          }
+        dest: /etc/logrotate.d/taskflow
+        mode: '0644'
