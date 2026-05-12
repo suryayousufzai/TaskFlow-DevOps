@@ -45,7 +45,7 @@ EXPOSE 5000
 
 # docker will ping this to check if the app is still alive
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')"
 
 # start the app with gunicorn, 2 workers + 2 threads should be fine for now
 CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "2", \

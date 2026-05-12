@@ -137,17 +137,36 @@ jobs:
             ${{ env.IMAGE_NAME }}:test
 
           echo "waiting for the app to start..."
+          APP_READY=false
           for i in $(seq 1 15); do
-            if curl -sf http://localhost:5000/health > /dev/null 2>&1; then
+            # bail early if the container already exited (crash)
+            STATUS=$(docker inspect --format='{{.State.Status}}' taskflow-test 2>/dev/null || echo "missing")
+            if [ "$STATUS" != "running" ]; then
+              echo "container stopped unexpectedly (status: $STATUS)"
+              break
+            fi
+            if curl -sf http://localhost:5000/api/health > /dev/null 2>&1; then
               echo "app is up!"
+              APP_READY=true
               break
             fi
             echo "attempt $i/15, still waiting..."
             sleep 2
           done
 
+          # always print logs so we can debug failures
+          echo "--- container logs ---"
+          docker logs taskflow-test 2>&1 || true
+
+          if [ "$APP_READY" != "true" ]; then
+            echo "app failed to start within timeout"
+            docker stop taskflow-test || true
+            docker rm taskflow-test || true
+            exit 1
+          fi
+
           echo "--- health check ---"
-          curl -sf http://localhost:5000/health | python3 -m json.tool
+          curl -sf http://localhost:5000/api/health | python3 -m json.tool
 
           echo "--- get all tasks ---"
           curl -sf http://localhost:5000/api/tasks | python3 -m json.tool
