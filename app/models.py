@@ -15,9 +15,9 @@ class Task(db.Model):
     id = db.Column(db.Integer, primary_key=True)
 
     # the actual task data
-    title       = db.Column(db.String(200), nullable=False)  # required, can't be empty
-    description = db.Column(db.Text, default='')             # optional, defaults to empty string
-    completed   = db.Column(db.Boolean, default=False)       # starts as not done
+    title = db.Column(db.String(200), nullable=False)  # required, can't be empty
+    description = db.Column(db.Text, default='')  # optional, defaults to empty string
+    completed = db.Column(db.Boolean, default=False)  # starts as not done
 
     # priority is one of: 'low', 'medium', 'high'
     priority = db.Column(db.String(10), default='medium')

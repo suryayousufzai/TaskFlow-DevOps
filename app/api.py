@@ -22,8 +22,8 @@ def error(msg, code=400):
 @api.route('/tasks', methods=['GET'])
 def get_tasks():
     # read optional filter params from the url
-    priority  = request.args.get('priority')
-    category  = request.args.get('category')
+    priority = request.args.get('priority')
+    category = request.args.get('category')
     completed = request.args.get('completed')
 
     # start with all tasks, then narrow down based on filters
@@ -154,9 +154,9 @@ def toggle_task(task_id):
 # used by the dashboard on the frontend
 @api.route('/stats', methods=['GET'])
 def get_stats():
-    total     = Task.query.count()
+    total = Task.query.count()
     completed = Task.query.filter_by(completed=True).count()
-    pending   = total - completed
+    pending = total - completed
 
     # count pending tasks grouped by priority
     by_priority = {
