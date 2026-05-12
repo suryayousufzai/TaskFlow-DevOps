@@ -1,0 +1,217 @@
+---
+# ansible playbook for taskflow
+# this sets up a server from scratch and deploys the app
+# run it with: ansible-playbook -i inventory.yml playbook.yml
+
+- name: set up and deploy taskflow
+  hosts: taskflow_servers
+  become: true   # run as root (sudo)
+
+  # variables i reuse throughout the playbook
+  vars:
+    app_name: taskflow
+    app_user: taskflow
+    app_dir: /opt/taskflow
+    app_port: 5000
+    docker_image: "taskflow:latest"
+    environment: production
+
+  tasks:
+
+    # -----------------------------------------------
+    # step 1: make sure the system packages are up to date
+    # -----------------------------------------------
+
+    - name: update apt package list
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600   # only re-fetch if cache is older than 1 hour
+
+    - name: install basic packages we need
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - git
+          - python3
+          - python3-pip
+        state: present
+
+    # -----------------------------------------------
+    # step 2: install docker
+    # docker doesn't come pre-installed so i have to add it manually
+    # -----------------------------------------------
+
+    - name: add docker's GPG key so apt trusts its packages
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: add docker's apt repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: install docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: make sure docker is running and starts on boot
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    # -----------------------------------------------
+    # step 3: create a dedicated user for the app
+    # it's bad practice to run apps as root, so i make a separate user
+    # -----------------------------------------------
+
+    - name: create the taskflow system user
+      user:
+        name: "{{ app_user }}"
+        system: yes
+        shell: /sbin/nologin   # no login shell needed, it's just for running the app
+        home: "{{ app_dir }}"
+        create_home: yes
+
+    - name: add taskflow user to the docker group so it can run containers
+      user:
+        name: "{{ app_user }}"
+        groups: docker
+        append: yes
+
+    - name: create the folders the app needs
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+      loop:
+        - "{{ app_dir }}"
+        - "{{ app_dir }}/data"
+        - "{{ app_dir }}/logs"
+
+    # -----------------------------------------------
+    # step 4: deploy the app
+    # -----------------------------------------------
+
+    - name: copy docker-compose.yml to the server
+      copy:
+        src: ../docker-compose.yml
+        dest: "{{ app_dir }}/docker-compose.yml"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+
+    # generate a random secret key for flask - never hardcode this
+    - name: generate a random secret key
+      command: python3 -c "import secrets; print(secrets.token_hex(32))"
+      register: secret_key_result
+      changed_when: false   # this command doesn't change system state, just generates a value
+
+    - name: write the .env file from template
+      template:
+        src: templates/env.j2
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600'   # only the owner can read it (the secret key is in here)
+      vars:
+        secret_key: "{{ secret_key_result.stdout }}"
+
+    - name: pull the docker image
+      docker_image:
+        name: "{{ docker_image }}"
+        source: pull
+        state: present
+
+    - name: start the app with docker compose
+      community.docker.docker_compose_v2:
+        project_src: "{{ app_dir }}"
+        state: present
+        pull: always
+
+    # -----------------------------------------------
+    # step 5: check that the app actually started
+    # -----------------------------------------------
+
+    # keep trying the health endpoint until it responds ok
+    # retries 10 times with 5 second waits = up to 50 seconds to start
+    - name: wait for the app to be ready
+      uri:
+        url: "http://localhost:{{ app_port }}/health"
+        method: GET
+        status_code: 200
+      register: health_result
+      retries: 10
+      delay: 5
+      until: health_result.status == 200
+
+    - name: print success message
+      debug:
+        msg: |
+          taskflow is running!
+          url: http://{{ ansible_default_ipv4.address }}:{{ app_port }}
+          status: {{ health_result.json.status }}
+
+    # -----------------------------------------------
+    # step 6: set up systemd so the app restarts on reboot
+    # -----------------------------------------------
+
+    - name: create a systemd service file for taskflow
+      template:
+        src: templates/taskflow.service.j2
+        dest: /etc/systemd/system/taskflow.service
+        mode: '0644'
+
+    - name: enable and start the taskflow service
+      systemd:
+        name: taskflow
+        enabled: yes
+        state: started
+        daemon_reload: yes   # reload systemd so it picks up the new service file
+
+    # -----------------------------------------------
+    # step 7: open the right port in the firewall
+    # -----------------------------------------------
+
+    - name: allow port {{ app_port }} through the firewall
+      ufw:
+        rule: allow
+        port: "{{ app_port }}"
+        proto: tcp
+
+
+# -----------------------------------------------
+# second play: set up log rotation
+# this runs separately so it stays optional
+# -----------------------------------------------
+- name: set up log rotation so logs don't fill the disk
+  hosts: taskflow_servers
+  become: true
+
+  tasks:
+    - name: add logrotate config for taskflow
+      copy:
+        content: |
+          /opt/taskflow/logs/*.log {
+            daily          # rotate every day
+            rotate 14      # keep 14 days of old logs
+            compress       # gzip the old ones to save space
+            delaycompress  # don't compress the most recent rotated file yet
+            missingok      # don't error if the log file doesn't exist
+            notifempty     # skip if the log is empty
+            sharedscripts  # only run scripts once even if multiple logs match
+          }
+        dest: /etc/logrotate.d/taskflow
+        mode: '0644'

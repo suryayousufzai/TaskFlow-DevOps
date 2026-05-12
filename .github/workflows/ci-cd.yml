@@ -1,0 +1,267 @@
+# my CI/CD pipeline for TaskFlow
+# this runs automatically when i push code to github
+# basically it checks my code, runs tests, builds docker, and deploys
+
+name: TaskFlow Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]   # runs when i push to main or develop
+  pull_request:
+    branches: [ main ]            # also runs when i open a pull request
+
+# some variables i reuse throughout the file
+env:
+  IMAGE_NAME: taskflow
+  REGISTRY: ghcr.io
+  PYTHON_VERSION: "3.12"
+
+
+# -----------------------------------------------
+# JOB 1: check if my code is clean
+# -----------------------------------------------
+jobs:
+  lint:
+    name: Check Code Style
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: download my code
+        uses: actions/checkout@v4
+
+      - name: set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'   # cache pip so it's faster next time
+
+      - name: install the tools i need for checking
+        run: pip install flake8 bandit
+
+      # flake8 checks if my code follows style rules (like line length)
+      - name: run flake8
+        run: |
+          flake8 app/ run.py \
+            --max-line-length=120 \
+            --exclude=__pycache__,migrations \
+            --statistics
+
+      # bandit checks for security problems in my code
+      # i put "|| true" so it doesn't fail the whole pipeline, just warns me
+      - name: run bandit security check
+        run: |
+          bandit -r app/ -ll \
+            --exclude app/static \
+            -f txt || true
+
+
+  # -----------------------------------------------
+  # JOB 2: run my tests
+  # (only runs if job 1 passed)
+  # -----------------------------------------------
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: lint   # wait for lint to finish first
+
+    steps:
+      - name: download my code
+        uses: actions/checkout@v4
+
+      - name: set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: install dependencies from requirements.txt
+        run: pip install -r requirements.txt
+
+      # pytest runs all my tests and also measures how much code is covered
+      - name: run pytest with coverage
+        run: |
+          pip install pytest-cov
+          pytest tests/ -v \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --tb=short
+
+      # save the coverage report as an artifact so i can download it later
+      - name: save coverage report
+        uses: actions/upload-artifact@v4
+        if: always()   # save it even if tests fail
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+
+  # -----------------------------------------------
+  # JOB 3: build docker image and test it
+  # (only runs if tests passed)
+  # -----------------------------------------------
+  docker-build:
+    name: Build and Test Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: download my code
+        uses: actions/checkout@v4
+
+      - name: set up docker buildx (needed for caching)
+        uses: docker/setup-buildx-action@v3
+
+      # build the docker image but don't push it yet, just test it locally
+      - name: build the image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:test
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # start the container and check if the app actually works
+      - name: quick smoke test - does the app start?
+        run: |
+          docker run -d \
+            --name taskflow-test \
+            -p 5000:5000 \
+            -e SECRET_KEY=ci-test-key \
+            ${{ env.IMAGE_NAME }}:test
+
+          echo "waiting for the app to start..."
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:5000/health > /dev/null 2>&1; then
+              echo "app is up!"
+              break
+            fi
+            echo "attempt $i/15, still waiting..."
+            sleep 2
+          done
+
+          echo "--- health check ---"
+          curl -sf http://localhost:5000/health | python3 -m json.tool
+
+          echo "--- get all tasks ---"
+          curl -sf http://localhost:5000/api/tasks | python3 -m json.tool
+
+          echo "--- create a new task ---"
+          curl -sf -X POST http://localhost:5000/api/tasks \
+            -H "Content-Type: application/json" \
+            -d '{"title":"CI smoke test","priority":"high"}' \
+            | python3 -m json.tool
+
+          echo "--- stats ---"
+          curl -sf http://localhost:5000/api/stats | python3 -m json.tool
+
+          # clean up the container
+          docker stop taskflow-test
+          docker rm taskflow-test
+
+      # trivy scans the image for known security vulnerabilities
+      # exit-code 0 means it won't fail the build, just shows warnings
+      - name: scan image for security issues
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:test
+          format: table
+          exit-code: '0'
+          severity: HIGH,CRITICAL
+
+
+  # -----------------------------------------------
+  # JOB 4: push the image to github's container registry
+  # (only runs on main branch, not on pull requests)
+  # -----------------------------------------------
+  push-image:
+    name: Push Docker Image
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    permissions:
+      contents: read
+      packages: write   # need this to push to ghcr.io
+
+    steps:
+      - name: download my code
+        uses: actions/checkout@v4
+
+      - name: log in to github container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # github sets this automatically
+
+      # this action creates the right tags for the image (branch name, commit hash, "latest")
+      - name: figure out image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: build and push the image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+  # -----------------------------------------------
+  # JOB 5: deploy to production
+  # (also only runs on main, after the image is pushed)
+  # NOTE: this is simulated for now, not a real server
+  # -----------------------------------------------
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: push-image
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    environment:
+      name: production
+      url: http://localhost:5000
+
+    steps:
+      - name: download my code
+        uses: actions/checkout@v4
+
+      # in a real project this would SSH into a server and run docker compose
+      # for now i'm just printing what would happen
+      - name: deploy with docker compose
+        run: |
+          echo "deploying TaskFlow..."
+          echo "image: ${{ env.REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}:latest"
+          echo ""
+          echo "in a real deployment this would:"
+          echo "  1. ssh into the production server"
+          echo "  2. pull the latest image from the registry"
+          echo "  3. run: docker compose up -d --pull always"
+          echo "  4. check the health endpoint to make sure it's running"
+          echo "  5. send a notification to slack or discord"
+          echo ""
+          echo "deployment simulated successfully!"
+
+      # this writes a nice summary to the github actions page
+      - name: write deployment summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Thing | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ env.IMAGE_NAME }}:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | deployed! |" >> $GITHUB_STEP_SUMMARY

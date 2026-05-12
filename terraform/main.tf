@@ -1,0 +1,233 @@
+# main.tf
+# terraform config for taskflow
+# i'm using the docker provider instead of a real cloud provider
+# so this runs 100% locally without needing an AWS/GCP account
+
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    docker = {
+      source  = "kreuzwerker/docker"
+      version = "~> 3.0"
+    }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.4"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
+  }
+
+  # in a real production setup you'd store state remotely so the team shares it
+  # something like this:
+  # backend "s3" {
+  #   bucket = "taskflow-terraform-state"
+  #   key    = "prod/terraform.tfstate"
+  #   region = "us-east-1"
+  # }
+}
+
+# connect to docker on the local machine
+provider "docker" {
+  host = "unix:///var/run/docker.sock"
+}
+
+# input variables - i can override these in terraform.tfvars
+variable "app_name" {
+  description = "Application name"
+  type        = string
+  default     = "taskflow"
+}
+
+variable "environment" {
+  description = "Deployment environment"
+  type        = string
+  default     = "production"
+  validation {
+    condition     = contains(["development", "staging", "production"], var.environment)
+    error_message = "Environment must be development, staging, or production."
+  }
+}
+
+variable "app_port" {
+  description = "Port to expose the application on"
+  type        = number
+  default     = 5000
+}
+
+variable "replicas" {
+  description = "Number of app container replicas"
+  type        = number
+  default     = 1
+}
+
+variable "image_tag" {
+  description = "Docker image tag to deploy"
+  type        = string
+  default     = "latest"
+}
+
+# generate a random secret key for flask
+# terraform stores this in state so it doesn't change on every apply
+resource "random_password" "secret_key" {
+  length           = 64
+  special          = true
+  override_special = "!@#$%^&*()-_=+"
+}
+
+# create a docker network so containers can talk to each other by name
+resource "docker_network" "taskflow_net" {
+  name   = "${var.app_name}-${var.environment}-network"
+  driver = "bridge"
+
+  labels {
+    label = "managed-by"
+    value = "terraform"
+  }
+  labels {
+    label = "environment"
+    value = var.environment
+  }
+}
+
+# create a docker volume so the sqlite database survives container restarts
+resource "docker_volume" "taskflow_data" {
+  name = "${var.app_name}-${var.environment}-data"
+
+  labels {
+    label = "managed-by"
+    value = "terraform"
+  }
+  labels {
+    label = "app"
+    value = var.app_name
+  }
+}
+
+# pull the docker image
+# keep_locally = true means terraform won't delete it when you run destroy
+resource "docker_image" "taskflow" {
+  name         = "${var.app_name}:${var.image_tag}"
+  keep_locally = true
+
+  # in production you'd pull from a registry instead of local:
+  # name = "ghcr.io/youruser/taskflow:${var.image_tag}"
+}
+
+# create the app container(s)
+# count lets me spin up multiple replicas if needed
+resource "docker_container" "taskflow_app" {
+  count = var.replicas
+
+  # first container gets the plain name, extras get a number suffix
+  name  = count.index == 0 ? "${var.app_name}-${var.environment}" : "${var.app_name}-${var.environment}-${count.index}"
+  image = docker_image.taskflow.image_id
+
+  restart = "unless-stopped"
+
+  networks_advanced {
+    name = docker_network.taskflow_net.name
+  }
+
+  # only the first replica gets the public port
+  # extra replicas would need a load balancer in front
+  dynamic "ports" {
+    for_each = count.index == 0 ? [1] : []
+    content {
+      internal = 5000
+      external = var.app_port
+      protocol = "tcp"
+    }
+  }
+
+  # mount the volume at /data so sqlite writes go there
+  volumes {
+    volume_name    = docker_volume.taskflow_data.name
+    container_path = "/data"
+  }
+
+  env = [
+    "SECRET_KEY=${random_password.secret_key.result}",
+    "DATABASE_URL=sqlite:////data/taskflow.db",
+    "ENVIRONMENT=${var.environment}",
+  ]
+
+  # docker will restart the container if this check fails 3 times
+  healthcheck {
+    test         = ["CMD", "python", "-c",
+                    "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+    interval     = "30s"
+    timeout      = "10s"
+    retries      = 3
+    start_period = "15s"  # give the app time to start before checking
+  }
+
+  # memory limit in MB - stops the container from eating all system memory
+  memory      = 256
+  memory_swap = 512
+
+  labels {
+    label = "managed-by"
+    value = "terraform"
+  }
+  labels {
+    label = "environment"
+    value = var.environment
+  }
+  labels {
+    label = "version"
+    value = var.image_tag
+  }
+}
+
+# write a .env file locally with the generated secrets
+# useful for running the app outside docker during development
+# file_permission 0600 = only i can read it (the secret key is in here)
+resource "local_file" "env_file" {
+  filename        = "${path.module}/.env.terraform"
+  file_permission = "0600"
+  content         = <<-EOT
+    # generated by terraform - do not commit this file
+    # environment: ${var.environment}
+    SECRET_KEY=${random_password.secret_key.result}
+    DATABASE_URL=sqlite:////data/taskflow.db
+    APP_PORT=${var.app_port}
+    ENVIRONMENT=${var.environment}
+  EOT
+}
+
+# outputs - these print to the terminal after terraform apply
+output "app_url" {
+  description = "TaskFlow application URL"
+  value       = "http://localhost:${var.app_port}"
+}
+
+output "container_names" {
+  description = "Names of deployed containers"
+  value       = docker_container.taskflow_app[*].name
+}
+
+output "network_name" {
+  description = "Docker network name"
+  value       = docker_network.taskflow_net.name
+}
+
+output "data_volume" {
+  description = "Persistent data volume name"
+  value       = docker_volume.taskflow_data.name
+}
+
+output "environment" {
+  description = "Deployed environment"
+  value       = var.environment
+}
+
+# just prints the length, not the actual key - that would be a security issue
+output "secret_key_length" {
+  description = "Secret key length (not the key itself)"
+  value       = length(random_password.secret_key.result)
+  sensitive   = false
+}

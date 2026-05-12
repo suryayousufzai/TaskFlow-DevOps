@@ -1,0 +1,20 @@
+---
+# ansible/inventory.yml
+
+
+all:
+  children:
+    taskflow_servers:
+      hosts:
+        production:
+          ansible_host: 192.168.1.100      
+          ansible_user: ubuntu
+          ansible_ssh_private_key_file: ~/.ssh/id_rsa
+          ansible_python_interpreter: /usr/bin/python3
+
+        # For local testing with Docker:
+        localhost_test:
+          ansible_host: 127.0.0.1
+          ansible_connection: local
+          ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
