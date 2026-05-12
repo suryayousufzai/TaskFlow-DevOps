@@ -10,6 +10,10 @@ on:
   pull_request:
     branches: [ main ]            # also runs when i open a pull request
 
+# default permissions for all jobs — the push-image job overrides with packages: write
+permissions:
+  contents: read
+
 # some variables i reuse throughout the file
 env:
   IMAGE_NAME: taskflow
